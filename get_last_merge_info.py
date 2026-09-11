@@ -22,17 +22,18 @@ git_login.json format:
     }
 
 output.csv format:
-    file_name,resolved_path,merge_owner,pushed_by,merge_message,merged_branch,merge_commit,merged_at,branch_merges
+    file_name,resolved_path,merge_owner,pushed_by,pushed_by_email,merge_message,merged_branch,merge_commit,merged_at,branch_merges
 
-    merge_owner   - the PR owner parsed from a "Merge pull request ... from owner/branch"
-                    message, falling back to the merge commit's author if no PR owner
-                    can be parsed out.
-    pushed_by     - the dev who actually wrote/pushed the code: the author of the
-                    tip commit on the branch that was merged in (the merge commit's
-                    second parent), not the person who performed the merge.
-    branch_merges - every merge commit anywhere in the repo's history whose message
-                    references the same merged_branch, formatted as
-                    "<short_hash> (<date>)" entries separated by "; ".
+    merge_owner     - the PR owner parsed from a "Merge pull request ... from owner/branch"
+                      message, falling back to the merge commit's author if no PR owner
+                      can be parsed out.
+    pushed_by       - the dev who actually wrote/pushed the code: the author of the
+                      tip commit on the branch that was merged in (the merge commit's
+                      second parent), not the person who performed the merge.
+    pushed_by_email - the git author email for that same tip commit.
+    branch_merges   - every merge commit anywhere in the repo's history whose message
+                      references the same merged_branch, formatted as
+                      "<short_hash> (<date>)" entries separated by "; ".
 """
 
 import argparse
@@ -116,13 +117,15 @@ def get_pushed_by(repo_path, merge_commit_hash):
     who pushed the changes is the author of the tip commit on the branch that
     got merged in - i.e. the merge commit's second parent. Falls back to the
     merge commit's own author if there's no second parent (e.g. a
-    fast-forward-style merge commit with only one parent)."""
+    fast-forward-style merge commit with only one parent).
+    Returns (name, email)."""
     parents = run_git(repo_path, ["log", "-1", "--pretty=format:%P", merge_commit_hash], check=False)
     parent_hashes = parents.split()
-    if len(parent_hashes) < 2:
-        return run_git(repo_path, ["log", "-1", "--pretty=format:%an", merge_commit_hash], check=False)
-    branch_tip = parent_hashes[1]
-    return run_git(repo_path, ["log", "-1", "--pretty=format:%an", branch_tip], check=False)
+    target_commit = parent_hashes[1] if len(parent_hashes) >= 2 else merge_commit_hash
+
+    info = run_git(repo_path, ["log", "-1", "--pretty=format:%an%x01%ae", target_commit], check=False)
+    name, _, email = info.partition("\x01")
+    return name, email
 
 
 def get_last_merge_info_for_file(repo_path, rel_file_path):
@@ -152,9 +155,12 @@ def get_last_merge_info_for_file(repo_path, rel_file_path):
         if m:
             merged_branch = m.group(1)
 
+    pushed_by_name, pushed_by_email = get_pushed_by(repo_path, commit_hash)
+
     return {
         "merge_owner": pr_owner or author,
-        "pushed_by": get_pushed_by(repo_path, commit_hash),
+        "pushed_by": pushed_by_name,
+        "pushed_by_email": pushed_by_email,
         "merge_message": subject,
         "merged_branch": merged_branch,
         "merge_commit": commit_hash,
@@ -248,7 +254,7 @@ def main():
             else:
                 err = f"ambiguous: found {len(matches)} files named '{file_name}': {matches}"
             result_row.update(
-                {"merge_owner": "", "pushed_by": "", "merge_message": f"ERROR: {err}",
+                {"merge_owner": "", "pushed_by": "", "pushed_by_email": "", "merge_message": f"ERROR: {err}",
                  "merged_branch": "", "merge_commit": "", "merged_at": "", "branch_merges": ""}
             )
             output_rows.append(result_row)
@@ -259,7 +265,7 @@ def main():
             info = get_last_merge_info_for_file(repo_path, rel_path)
             if "error" in info:
                 result_row.update(
-                    {"merge_owner": "", "pushed_by": "", "merge_message": f"ERROR: {info['error']}",
+                    {"merge_owner": "", "pushed_by": "", "pushed_by_email": "", "merge_message": f"ERROR: {info['error']}",
                      "merged_branch": "", "merge_commit": "", "merged_at": "", "branch_merges": ""}
                 )
             else:
@@ -269,14 +275,14 @@ def main():
                 )
         except Exception as e:
             result_row.update(
-                {"merge_owner": "", "pushed_by": "", "merge_message": f"ERROR: {e}",
+                {"merge_owner": "", "pushed_by": "", "pushed_by_email": "", "merge_message": f"ERROR: {e}",
                  "merged_branch": "", "merge_commit": "", "merged_at": "", "branch_merges": ""}
             )
 
         output_rows.append(result_row)
 
     with open(args.output, "w", newline="") as f:
-        fieldnames = ["file_name", "resolved_path", "merge_owner", "pushed_by", "merge_message",
+        fieldnames = ["file_name", "resolved_path", "merge_owner", "pushed_by", "pushed_by_email", "merge_message",
                       "merged_branch", "merge_commit", "merged_at", "branch_merges"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
