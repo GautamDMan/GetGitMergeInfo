@@ -17,7 +17,8 @@ input.csv format:
 
 git_login.json format:
     {
-        "repo_path": "/path/to/the/repo"
+        "repo_path": "/path/to/the/repo",
+        "branch": "main"    // optional - if given, the repo is hard-reset to this branch first
     }
 
 output.csv format:
@@ -57,7 +58,15 @@ def load_credentials(creds_path):
         raise ValueError("git_login.json must contain a 'repo_path' field")
     if not os.path.isdir(os.path.join(repo_path, ".git")):
         raise ValueError(f"'{repo_path}' does not look like a git repository (no .git folder)")
-    return repo_path
+    branch = creds.get("branch")  # optional
+    return repo_path, branch
+
+
+def hard_reset_to_branch(repo_path, branch):
+    """Checks out the given branch and hard-resets the working tree to it,
+    discarding any local changes/commits that aren't on that branch tip."""
+    run_git(repo_path, ["checkout", branch])
+    run_git(repo_path, ["reset", "--hard", branch])
 
 
 def load_file_names(input_csv):
@@ -137,7 +146,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        repo_path = load_credentials(args.creds)
+        repo_path, branch = load_credentials(args.creds)
     except Exception as e:
         print(f"Error loading credentials: {e}", file=sys.stderr)
         sys.exit(1)
@@ -147,6 +156,14 @@ def main():
     except Exception as e:
         print(f"Error loading input.csv: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if branch:
+        print(f"Hard-resetting {repo_path} to branch '{branch}'...")
+        try:
+            hard_reset_to_branch(repo_path, branch)
+        except Exception as e:
+            print(f"Error resetting to branch '{branch}': {e}", file=sys.stderr)
+            sys.exit(1)
 
     output_rows = []
     for file_name in file_names:

@@ -8,9 +8,14 @@ message, and the branch it came from.
 
 For each file name in `input.csv`, the script:
 
-1. Searches the repo (given by `repo_path` in `git_login.json`) for a file
+1. If `branch` is set in `git_login.json`, first checks out that branch and
+   runs `git reset --hard <branch>` to discard any local changes and align
+   the working tree exactly to that branch's tip — before any searching or
+   merge-info lookup happens. If `branch` is omitted, this step is skipped
+   and the repo is read exactly as it currently sits on disk.
+2. Searches the repo (given by `repo_path` in `git_login.json`) for a file
    with that exact name, anywhere in the tree.
-2. If exactly one match is found, looks up the most recent **merge commit**
+3. If exactly one match is found, looks up the most recent **merge commit**
    that touched that file and parses out:
    - **merge_owner** — the PR submitter if the merge commit message matches
      `Merge pull request #N from owner/branch`, otherwise falls back to the
@@ -21,11 +26,12 @@ For each file name in `input.csv`, the script:
      `Merge branch 'branch-name'` styles).
    - **merge_commit** — the full commit hash.
    - **merged_at** — the commit's ISO 8601 timestamp.
-3. Writes one row per file name to `output.csv`.
+4. Writes one row per file name to `output.csv`.
 
-No `git fetch` or `git reset` is performed — the repo is read exactly as it
-currently sits on disk. If you need it up to date first, run `git pull`
-yourself before running this script.
+No `git fetch` is performed — only a local checkout + hard reset to whatever
+`branch` currently points to on disk. If you need the branch itself updated
+from a remote first, run `git fetch`/`git pull` yourself before running this
+script.
 
 ## Requirements
 
@@ -57,14 +63,19 @@ tree for it.
 
 ```json
 {
-  "repo_path": "/path/to/the/repo"
+  "repo_path": "/path/to/the/repo",
+  "branch": "main"
 }
 ```
 
 - `repo_path` — the local path to the one git repository to search within.
-  This is the only required field; since the script only reads local history
-  (no fetch/reset/auth needed), no credentials are actually required here
-  despite the file's name.
+- `branch` — optional. If given, the repo is hard-reset to this branch
+  (`git checkout <branch>` + `git reset --hard <branch>`) before any file
+  searching happens. **This discards uncommitted local changes** in the repo.
+  If omitted, no reset is performed and the repo is read as-is.
+
+No actual git credentials/tokens are required here despite the file's name —
+everything the script does is local (checkout, reset, log).
 
 ## Output file format
 
@@ -82,6 +93,17 @@ so one problem file won't stop the rest of the batch. Two error cases:
 - **Ambiguous** — more than one file shares that name (e.g. `utils.py` in
   both `src/` and `tests/`); the error message lists every matching path
   found so you can pick which one you meant.
+
+## Important caveats
+
+- **Destructive operation:** when `branch` is set, `git reset --hard`
+  discards any local uncommitted changes in the repo before searching for
+  files. Don't point this at a repo with work you haven't committed or
+  stashed, unless you're fine losing it.
+- **No remote sync:** the reset targets whatever `branch` already points to
+  locally — it does not fetch or pull first. If your local branch is behind
+  the remote, you'll get merge info as of the local branch tip, not the
+  latest remote state.
 
 ## Important technical note
 
