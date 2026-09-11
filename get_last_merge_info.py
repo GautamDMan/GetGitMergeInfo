@@ -1,46 +1,27 @@
 #!/usr/bin/env python3
 """
-For each repo listed in input.csv, resets a local git working copy to the
-specified branch (fetching from origin first) and extracts the last merge
-commit's info (owner/author, merge message, merged-in branch).
+For each file name listed in input.csv, searches for that file inside a
+single local git repository, then reads the file's git history to find the
+last merge commit that touched it - reporting who merged it, the merge
+message, and the branch it came from. No fetch or reset is performed; the
+repo is read exactly as it currently sits on disk.
 
 Usage:
-    python get_last_merge_info.py --input input.csv --creds git_login.json --output output.csv --search-root /path/to/parent/dir
+    python get_last_merge_info.py --input input.csv --creds git_login.json --output output.csv
 
-input.csv format (either style works):
-
-    # Style A: give the repo name/object and let the script find it
-    repo,branch
-    myservice,main
-    other-repo,develop
-
-    # Style B: give the exact local path directly (skips searching)
-    repo_path,branch
-    /path/to/repo1,main
-    /path/to/repo2,develop
-
-When input.csv uses the "repo" column, --search-root is walked recursively to
-find a directory matching that name which contains a .git folder. If exactly
-one match is found, it's used automatically. If zero or multiple matches are
-found, the row is recorded as an error in output.csv (ambiguous matches are
-all listed so you can disambiguate).
+input.csv format:
+    file_name
+    config.py
+    utils.py
+    README.md
 
 git_login.json format:
     {
-        "username": "yourname",
-        "email": "you@example.com",
-        "token": "ghp_xxx",        // optional, only needed for HTTPS remotes that require auth
-        "search_root": "/path/to/parent/dir",   // optional, used when input.csv has a 'repo' name column
-        "repo_paths": {                          // optional, per-name path overrides (skip searching)
-            "myservice": "/exact/path/to/myservice"
-        }
+        "repo_path": "/path/to/the/repo"
     }
 
---search-root on the command line, if given, takes priority over the
-"search_root" value in git_login.json.
-
 output.csv format:
-    repo_path,branch,merge_owner,merge_message,merged_branch,merge_commit,merged_at
+    file_name,resolved_path,merge_owner,merge_message,merged_branch,merge_commit,merged_at
 """
 
 import argparse
@@ -50,7 +31,6 @@ import os
 import re
 import subprocess
 import sys
-from urllib.parse import urlsplit, urlunsplit
 
 # Matches: "Merge pull request #123 from owner/branch-name"
 PR_MERGE_RE = re.compile(r"Merge pull request #\d+ from ([^\s/]+)/(\S+)")
@@ -71,102 +51,60 @@ def run_git(repo_path, args, check=True):
 
 def load_credentials(creds_path):
     with open(creds_path, "r") as f:
-        return json.load(f)
+        creds = json.load(f)
+    repo_path = creds.get("repo_path")
+    if not repo_path:
+        raise ValueError("git_login.json must contain a 'repo_path' field")
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        raise ValueError(f"'{repo_path}' does not look like a git repository (no .git folder)")
+    return repo_path
 
 
-def load_rows(input_csv):
-    """Supports two input.csv styles:
-      - columns 'repo_path','branch'  -> exact local path given directly
-      - columns 'repo','branch'       -> repo name/object to search for
-    """
-    rows = []
+def load_file_names(input_csv):
+    names = []
     with open(input_csv, "r", newline="") as f:
         reader = csv.DictReader(f)
-        fieldnames = set(reader.fieldnames or [])
-        has_path = "repo_path" in fieldnames
-        has_name = "repo" in fieldnames
-        if "branch" not in fieldnames or not (has_path or has_name):
+        if "file_name" not in (reader.fieldnames or []):
             raise ValueError(
-                "input.csv must have a 'branch' column plus either 'repo_path' "
-                f"(exact path) or 'repo' (name to search for). Found: {reader.fieldnames}"
+                f"input.csv must have a 'file_name' column. Found: {reader.fieldnames}"
             )
         for row in reader:
-            branch = row["branch"].strip()
-            if has_path and row.get("repo_path", "").strip():
-                rows.append({
-                    "identifier": row["repo_path"].strip(),
-                    "mode": "path",
-                    "branch": branch,
-                })
-            elif has_name and row.get("repo", "").strip():
-                rows.append({
-                    "identifier": row["repo"].strip(),
-                    "mode": "search",
-                    "branch": branch,
-                })
-    return rows
+            name = row["file_name"].strip()
+            if name:
+                names.append(name)
+    return names
 
 
-def find_repo_path(search_root, repo_name):
-    """Recursively search search_root for a directory named repo_name that
-    contains a .git folder. Returns (path_or_None, list_of_all_matches)."""
+def find_file_in_repo(repo_path, file_name):
+    """Search repo_path for a file named file_name (excluding .git internals).
+    Returns (relative_path_or_None, list_of_all_relative_matches)."""
     matches = []
-    for dirpath, dirnames, _filenames in os.walk(search_root):
-        # Don't descend into .git internals - no need to search inside them
+    for dirpath, dirnames, filenames in os.walk(repo_path):
         if ".git" in dirnames:
-            if os.path.basename(dirpath) == repo_name:
-                matches.append(dirpath)
-            # prevent walking into this repo's .git directory contents
             dirnames.remove(".git")
+        if file_name in filenames:
+            full_path = os.path.join(dirpath, file_name)
+            rel_path = os.path.relpath(full_path, repo_path)
+            matches.append(rel_path)
     if len(matches) == 1:
         return matches[0], matches
     return None, matches
 
 
-def set_local_identity(repo_path, creds):
-    if creds.get("username"):
-        run_git(repo_path, ["config", "user.name", creds["username"]])
-    if creds.get("email"):
-        run_git(repo_path, ["config", "user.email", creds["email"]])
-
-
-def inject_token_into_remote(repo_path, remote, token):
-    """If the remote is HTTPS, temporarily embed the token for auth.
-    Returns the original URL so it can be restored afterwards (or None)."""
-    original_url = run_git(repo_path, ["remote", "get-url", remote], check=False)
-    if not original_url or not token:
-        return None
-    parts = urlsplit(original_url)
-    if parts.scheme not in ("http", "https"):
-        return None  # SSH or other - leave untouched
-    new_netloc = f"{token}@{parts.netloc}"
-    new_url = urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
-    run_git(repo_path, ["remote", "set-url", remote, new_url])
-    return original_url
-
-
-def restore_remote(repo_path, remote, original_url):
-    if original_url:
-        run_git(repo_path, ["remote", "set-url", remote, original_url])
-
-
-def fetch_and_reset(repo_path, branch, remote="origin"):
-    run_git(repo_path, ["fetch", remote])
-    # Create/switch to a local branch tracking the remote one if needed
-    run_git(repo_path, ["checkout", "-B", branch, f"{remote}/{branch}"])
-    run_git(repo_path, ["reset", "--hard", f"{remote}/{branch}"])
-
-
-def get_last_merge_info(repo_path):
-    """Find the most recent merge commit and parse owner/message/branch from it."""
+def get_last_merge_info_for_file(repo_path, rel_file_path):
+    """Find the most recent merge commit that touched rel_file_path and parse
+    owner/message/branch from it. Uses --full-history alongside --merges
+    because git's default path-based history simplification hides merge
+    commits whose result is identical to one parent (the common case for a
+    clean, non-conflicting merge) - without it, real merges get missed."""
     log_format = "%H%x01%an%x01%s%x01%cI"
     output = run_git(
         repo_path,
-        ["log", "--merges", "-1", f"--pretty=format:{log_format}"],
+        ["log", "--merges", "--full-history", "-1", f"--pretty=format:{log_format}", "--", rel_file_path],
         check=False,
     )
     if not output:
-        return {"error": "no merge commits found on this branch"}
+        return {"error": "no merge commit found that touched this file"}
 
     commit_hash, author, subject, committed_at = output.split("\x01")
 
@@ -190,70 +128,47 @@ def get_last_merge_info(repo_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Reset local git repos and extract last merge info")
-    parser.add_argument("--input", default="input.csv", help="Path to input.csv")
-    parser.add_argument("--creds", default="git_login.json", help="Path to git login JSON")
-    parser.add_argument("--output", default="output.csv", help="Path to output.csv")
-    parser.add_argument("--remote", default="origin", help="Remote name (default: origin)")
-    parser.add_argument(
-        "--search-root",
-        default=None,
-        help="Root directory to search under when input.csv uses a 'repo' name column "
-             "instead of 'repo_path'. Overrides 'search_root' in git_login.json if given. "
-             "Falls back to current directory if neither is set.",
+    parser = argparse.ArgumentParser(
+        description="Find last merge info for each file name listed in input.csv"
     )
+    parser.add_argument("--input", default="input.csv", help="Path to input.csv")
+    parser.add_argument("--creds", default="git_login.json", help="Path to git_login.json")
+    parser.add_argument("--output", default="output.csv", help="Path to output.csv")
     args = parser.parse_args()
 
     try:
-        creds = load_credentials(args.creds)
+        repo_path = load_credentials(args.creds)
     except Exception as e:
         print(f"Error loading credentials: {e}", file=sys.stderr)
         sys.exit(1)
 
     try:
-        rows_in = load_rows(args.input)
+        file_names = load_file_names(args.input)
     except Exception as e:
         print(f"Error loading input.csv: {e}", file=sys.stderr)
         sys.exit(1)
 
-    search_root = args.search_root or creds.get("search_root") or "."
-    repo_path_overrides = creds.get("repo_paths", {})
-
     output_rows = []
-    for row in rows_in:
-        identifier, mode, branch = row["identifier"], row["mode"], row["branch"]
-        result_row = {"repo_path": identifier, "branch": branch}
+    for file_name in file_names:
+        print(f"Searching for '{file_name}' in {repo_path}...")
+        result_row = {"file_name": file_name, "resolved_path": ""}
 
-        if mode == "search":
-            if identifier in repo_path_overrides:
-                repo_path = repo_path_overrides[identifier]
-                print(f"Using overridden path for '{identifier}': {repo_path}")
+        rel_path, matches = find_file_in_repo(repo_path, file_name)
+        if rel_path is None:
+            if not matches:
+                err = f"file '{file_name}' not found in repo"
             else:
-                print(f"Searching for repo '{identifier}' under {search_root}...")
-                repo_path, matches = find_repo_path(search_root, identifier)
-                if repo_path is None:
-                    if not matches:
-                        err = f"no repo named '{identifier}' found under {search_root}"
-                    else:
-                        err = f"ambiguous: found {len(matches)} repos named '{identifier}': {matches}"
-                    result_row.update(
-                        {"merge_owner": "", "merge_message": f"ERROR: {err}",
-                         "merged_branch": "", "merge_commit": "", "merged_at": ""}
-                    )
-                    output_rows.append(result_row)
-                    continue
-            result_row["repo_path"] = repo_path
-        else:
-            repo_path = identifier
+                err = f"ambiguous: found {len(matches)} files named '{file_name}': {matches}"
+            result_row.update(
+                {"merge_owner": "", "merge_message": f"ERROR: {err}",
+                 "merged_branch": "", "merge_commit": "", "merged_at": ""}
+            )
+            output_rows.append(result_row)
+            continue
 
-        print(f"Processing {repo_path} -> branch '{branch}'...")
-
-        original_remote_url = None
+        result_row["resolved_path"] = rel_path
         try:
-            set_local_identity(repo_path, creds)
-            original_remote_url = inject_token_into_remote(repo_path, args.remote, creds.get("token"))
-            fetch_and_reset(repo_path, branch, remote=args.remote)
-            info = get_last_merge_info(repo_path)
+            info = get_last_merge_info_for_file(repo_path, rel_path)
             if "error" in info:
                 result_row.update(
                     {"merge_owner": "", "merge_message": f"ERROR: {info['error']}",
@@ -266,14 +181,11 @@ def main():
                 {"merge_owner": "", "merge_message": f"ERROR: {e}",
                  "merged_branch": "", "merge_commit": "", "merged_at": ""}
             )
-        finally:
-            if original_remote_url:
-                restore_remote(repo_path, args.remote, original_remote_url)
 
         output_rows.append(result_row)
 
     with open(args.output, "w", newline="") as f:
-        fieldnames = ["repo_path", "branch", "merge_owner", "merge_message",
+        fieldnames = ["file_name", "resolved_path", "merge_owner", "merge_message",
                       "merged_branch", "merge_commit", "merged_at"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
