@@ -27,8 +27,9 @@ output.csv format:
     merge_owner   - the PR owner parsed from a "Merge pull request ... from owner/branch"
                     message, falling back to the merge commit's author if no PR owner
                     can be parsed out.
-    pushed_by     - the git author of the merge commit itself (i.e. the dev who
-                    actually pushed/performed the merge), always populated.
+    pushed_by     - the dev who actually wrote/pushed the code: the author of the
+                    tip commit on the branch that was merged in (the merge commit's
+                    second parent), not the person who performed the merge.
     branch_merges - every merge commit anywhere in the repo's history whose message
                     references the same merged_branch, formatted as
                     "<short_hash> (<date>)" entries separated by "; ".
@@ -109,6 +110,21 @@ def find_file_in_repo(repo_path, file_name):
     return None, matches
 
 
+def get_pushed_by(repo_path, merge_commit_hash):
+    """The merge commit's author is whoever performed the merge (often a
+    maintainer or a bot), not necessarily who wrote the code. The actual dev
+    who pushed the changes is the author of the tip commit on the branch that
+    got merged in - i.e. the merge commit's second parent. Falls back to the
+    merge commit's own author if there's no second parent (e.g. a
+    fast-forward-style merge commit with only one parent)."""
+    parents = run_git(repo_path, ["log", "-1", "--pretty=format:%P", merge_commit_hash], check=False)
+    parent_hashes = parents.split()
+    if len(parent_hashes) < 2:
+        return run_git(repo_path, ["log", "-1", "--pretty=format:%an", merge_commit_hash], check=False)
+    branch_tip = parent_hashes[1]
+    return run_git(repo_path, ["log", "-1", "--pretty=format:%an", branch_tip], check=False)
+
+
 def get_last_merge_info_for_file(repo_path, rel_file_path):
     """Find the most recent merge commit that touched rel_file_path and parse
     owner/message/branch from it. Uses --full-history alongside --merges
@@ -138,7 +154,7 @@ def get_last_merge_info_for_file(repo_path, rel_file_path):
 
     return {
         "merge_owner": pr_owner or author,
-        "pushed_by": author,
+        "pushed_by": get_pushed_by(repo_path, commit_hash),
         "merge_message": subject,
         "merged_branch": merged_branch,
         "merge_commit": commit_hash,
