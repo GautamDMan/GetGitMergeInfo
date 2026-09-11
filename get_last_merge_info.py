@@ -5,19 +5,39 @@ specified branch (fetching from origin first) and extracts the last merge
 commit's info (owner/author, merge message, merged-in branch).
 
 Usage:
-    python get_last_merge_info.py --input input.csv --creds git_login.json --output output.csv
+    python get_last_merge_info.py --input input.csv --creds git_login.json --output output.csv --search-root /path/to/parent/dir
 
-input.csv format:
+input.csv format (either style works):
+
+    # Style A: give the repo name/object and let the script find it
+    repo,branch
+    myservice,main
+    other-repo,develop
+
+    # Style B: give the exact local path directly (skips searching)
     repo_path,branch
     /path/to/repo1,main
     /path/to/repo2,develop
+
+When input.csv uses the "repo" column, --search-root is walked recursively to
+find a directory matching that name which contains a .git folder. If exactly
+one match is found, it's used automatically. If zero or multiple matches are
+found, the row is recorded as an error in output.csv (ambiguous matches are
+all listed so you can disambiguate).
 
 git_login.json format:
     {
         "username": "yourname",
         "email": "you@example.com",
-        "token": "ghp_xxx"   // optional, only needed for HTTPS remotes that require auth
+        "token": "ghp_xxx",        // optional, only needed for HTTPS remotes that require auth
+        "search_root": "/path/to/parent/dir",   // optional, used when input.csv has a 'repo' name column
+        "repo_paths": {                          // optional, per-name path overrides (skip searching)
+            "myservice": "/exact/path/to/myservice"
+        }
     }
+
+--search-root on the command line, if given, takes priority over the
+"search_root" value in git_login.json.
 
 output.csv format:
     repo_path,branch,merge_owner,merge_message,merged_branch,merge_commit,merged_at
@@ -26,6 +46,7 @@ output.csv format:
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -54,20 +75,52 @@ def load_credentials(creds_path):
 
 
 def load_rows(input_csv):
+    """Supports two input.csv styles:
+      - columns 'repo_path','branch'  -> exact local path given directly
+      - columns 'repo','branch'       -> repo name/object to search for
+    """
     rows = []
     with open(input_csv, "r", newline="") as f:
         reader = csv.DictReader(f)
-        required = {"repo_path", "branch"}
-        if not required.issubset(set(reader.fieldnames or [])):
+        fieldnames = set(reader.fieldnames or [])
+        has_path = "repo_path" in fieldnames
+        has_name = "repo" in fieldnames
+        if "branch" not in fieldnames or not (has_path or has_name):
             raise ValueError(
-                f"input.csv must have columns {required}. Found: {reader.fieldnames}"
+                "input.csv must have a 'branch' column plus either 'repo_path' "
+                f"(exact path) or 'repo' (name to search for). Found: {reader.fieldnames}"
             )
         for row in reader:
-            repo_path = row["repo_path"].strip()
             branch = row["branch"].strip()
-            if repo_path and branch:
-                rows.append({"repo_path": repo_path, "branch": branch})
+            if has_path and row.get("repo_path", "").strip():
+                rows.append({
+                    "identifier": row["repo_path"].strip(),
+                    "mode": "path",
+                    "branch": branch,
+                })
+            elif has_name and row.get("repo", "").strip():
+                rows.append({
+                    "identifier": row["repo"].strip(),
+                    "mode": "search",
+                    "branch": branch,
+                })
     return rows
+
+
+def find_repo_path(search_root, repo_name):
+    """Recursively search search_root for a directory named repo_name that
+    contains a .git folder. Returns (path_or_None, list_of_all_matches)."""
+    matches = []
+    for dirpath, dirnames, _filenames in os.walk(search_root):
+        # Don't descend into .git internals - no need to search inside them
+        if ".git" in dirnames:
+            if os.path.basename(dirpath) == repo_name:
+                matches.append(dirpath)
+            # prevent walking into this repo's .git directory contents
+            dirnames.remove(".git")
+    if len(matches) == 1:
+        return matches[0], matches
+    return None, matches
 
 
 def set_local_identity(repo_path, creds):
@@ -142,6 +195,13 @@ def main():
     parser.add_argument("--creds", default="git_login.json", help="Path to git login JSON")
     parser.add_argument("--output", default="output.csv", help="Path to output.csv")
     parser.add_argument("--remote", default="origin", help="Remote name (default: origin)")
+    parser.add_argument(
+        "--search-root",
+        default=None,
+        help="Root directory to search under when input.csv uses a 'repo' name column "
+             "instead of 'repo_path'. Overrides 'search_root' in git_login.json if given. "
+             "Falls back to current directory if neither is set.",
+    )
     args = parser.parse_args()
 
     try:
@@ -156,12 +216,38 @@ def main():
         print(f"Error loading input.csv: {e}", file=sys.stderr)
         sys.exit(1)
 
+    search_root = args.search_root or creds.get("search_root") or "."
+    repo_path_overrides = creds.get("repo_paths", {})
+
     output_rows = []
     for row in rows_in:
-        repo_path, branch = row["repo_path"], row["branch"]
+        identifier, mode, branch = row["identifier"], row["mode"], row["branch"]
+        result_row = {"repo_path": identifier, "branch": branch}
+
+        if mode == "search":
+            if identifier in repo_path_overrides:
+                repo_path = repo_path_overrides[identifier]
+                print(f"Using overridden path for '{identifier}': {repo_path}")
+            else:
+                print(f"Searching for repo '{identifier}' under {search_root}...")
+                repo_path, matches = find_repo_path(search_root, identifier)
+                if repo_path is None:
+                    if not matches:
+                        err = f"no repo named '{identifier}' found under {search_root}"
+                    else:
+                        err = f"ambiguous: found {len(matches)} repos named '{identifier}': {matches}"
+                    result_row.update(
+                        {"merge_owner": "", "merge_message": f"ERROR: {err}",
+                         "merged_branch": "", "merge_commit": "", "merged_at": ""}
+                    )
+                    output_rows.append(result_row)
+                    continue
+            result_row["repo_path"] = repo_path
+        else:
+            repo_path = identifier
+
         print(f"Processing {repo_path} -> branch '{branch}'...")
 
-        result_row = {"repo_path": repo_path, "branch": branch}
         original_remote_url = None
         try:
             set_local_identity(repo_path, creds)
