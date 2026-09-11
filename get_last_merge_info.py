@@ -22,7 +22,16 @@ git_login.json format:
     }
 
 output.csv format:
-    file_name,resolved_path,merge_owner,merge_message,merged_branch,merge_commit,merged_at
+    file_name,resolved_path,merge_owner,pushed_by,merge_message,merged_branch,merge_commit,merged_at,branch_merges
+
+    merge_owner   - the PR owner parsed from a "Merge pull request ... from owner/branch"
+                    message, falling back to the merge commit's author if no PR owner
+                    can be parsed out.
+    pushed_by     - the git author of the merge commit itself (i.e. the dev who
+                    actually pushed/performed the merge), always populated.
+    branch_merges - every merge commit anywhere in the repo's history whose message
+                    references the same merged_branch, formatted as
+                    "<short_hash> (<date>)" entries separated by "; ".
 """
 
 import argparse
@@ -129,11 +138,56 @@ def get_last_merge_info_for_file(repo_path, rel_file_path):
 
     return {
         "merge_owner": pr_owner or author,
+        "pushed_by": author,
         "merge_message": subject,
         "merged_branch": merged_branch,
         "merge_commit": commit_hash,
         "merged_at": committed_at,
     }
+
+
+def get_all_merges_for_branch(repo_path, branch_name, cache):
+    """Find every merge commit anywhere in the repo's history whose subject
+    references branch_name (same parsing rules as get_last_merge_info_for_file),
+    not just the most recent one and not limited to a specific file. Results
+    are cached per branch_name since many files can share the same branch."""
+    if not branch_name:
+        return ""
+    if branch_name in cache:
+        return cache[branch_name]
+
+    log_format = "%H%x01%s%x01%cI"
+    output = run_git(
+        repo_path,
+        ["log", "--merges", "--all", f"--pretty=format:{log_format}"],
+        check=False,
+    )
+
+    entries = []
+    if output:
+        for line in output.split("\n"):
+            if not line:
+                continue
+            parts = line.split("\x01")
+            if len(parts) != 3:
+                continue
+            commit_hash, subject, committed_at = parts
+
+            matched_branch = None
+            m = PR_MERGE_RE.search(subject)
+            if m:
+                matched_branch = m.group(2)
+            else:
+                m = BRANCH_MERGE_RE.search(subject)
+                if m:
+                    matched_branch = m.group(1)
+
+            if matched_branch == branch_name:
+                entries.append(f"{commit_hash[:8]} ({committed_at})")
+
+    result = "; ".join(entries)
+    cache[branch_name] = result
+    return result
 
 
 def main():
@@ -166,6 +220,7 @@ def main():
             sys.exit(1)
 
     output_rows = []
+    branch_merges_cache = {}
     for file_name in file_names:
         print(f"Searching for '{file_name}' in {repo_path}...")
         result_row = {"file_name": file_name, "resolved_path": ""}
@@ -177,8 +232,8 @@ def main():
             else:
                 err = f"ambiguous: found {len(matches)} files named '{file_name}': {matches}"
             result_row.update(
-                {"merge_owner": "", "merge_message": f"ERROR: {err}",
-                 "merged_branch": "", "merge_commit": "", "merged_at": ""}
+                {"merge_owner": "", "pushed_by": "", "merge_message": f"ERROR: {err}",
+                 "merged_branch": "", "merge_commit": "", "merged_at": "", "branch_merges": ""}
             )
             output_rows.append(result_row)
             continue
@@ -188,22 +243,25 @@ def main():
             info = get_last_merge_info_for_file(repo_path, rel_path)
             if "error" in info:
                 result_row.update(
-                    {"merge_owner": "", "merge_message": f"ERROR: {info['error']}",
-                     "merged_branch": "", "merge_commit": "", "merged_at": ""}
+                    {"merge_owner": "", "pushed_by": "", "merge_message": f"ERROR: {info['error']}",
+                     "merged_branch": "", "merge_commit": "", "merged_at": "", "branch_merges": ""}
                 )
             else:
                 result_row.update(info)
+                result_row["branch_merges"] = get_all_merges_for_branch(
+                    repo_path, info["merged_branch"], branch_merges_cache
+                )
         except Exception as e:
             result_row.update(
-                {"merge_owner": "", "merge_message": f"ERROR: {e}",
-                 "merged_branch": "", "merge_commit": "", "merged_at": ""}
+                {"merge_owner": "", "pushed_by": "", "merge_message": f"ERROR: {e}",
+                 "merged_branch": "", "merge_commit": "", "merged_at": "", "branch_merges": ""}
             )
 
         output_rows.append(result_row)
 
     with open(args.output, "w", newline="") as f:
-        fieldnames = ["file_name", "resolved_path", "merge_owner", "merge_message",
-                      "merged_branch", "merge_commit", "merged_at"]
+        fieldnames = ["file_name", "resolved_path", "merge_owner", "pushed_by", "merge_message",
+                      "merged_branch", "merge_commit", "merged_at", "branch_merges"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(output_rows)
