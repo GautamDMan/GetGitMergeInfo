@@ -8,8 +8,8 @@ it, who pushed the code, the merge message, and the branch it came from.
 
 What changed vs. the original (same CLI, same output columns):
   * The file tree is indexed ONCE with `git ls-tree` (no os.walk per file).
-  * History is scanned in ONE streaming `git log -m --name-only` pass for all
-    files, and stops early as soon as every file has been resolved
+  * History is scanned in ONE streaming `git log --first-parent -m --name-only`
+    pass for all files, and stops early as soon as every file has been resolved
     (original: one path-filtered `git log` per file).
   * "pushed_by" lookups are batched into a single git call
     (original: 2 git calls per file).
@@ -150,8 +150,11 @@ def find_last_merges(repo_path, ref, target_paths):
     """Return {path: (hash, parents, author, subject, committed_at)} for the most
     recent merge commit touching each path. Stops as soon as all are found.
 
-    `-m` makes git diff each merge against each parent, so --name-only lists
-    files that differ from either side - i.e. what the merge brought in."""
+    --first-parent walks only the branch's own line of history and, together
+    with -m, diffs each merge against its FIRST parent only. So --name-only
+    lists exactly the files whose content the merge brought into the branch.
+    (Diffing against both parents would also list files merely changed on the
+    branch itself, crediting the merge for changes it did not bring.)"""
     remaining = set(target_paths)
     found = {}
     if not remaining:
@@ -159,8 +162,8 @@ def find_last_merges(repo_path, ref, target_paths):
 
     fmt = f"{MARK}%H{SEP}%P{SEP}%an{SEP}%s{SEP}%cI"
     proc = subprocess.Popen(
-        git_cmd(repo_path, ["log", ref, "--merges", "-m", "--name-only",
-                            f"--pretty=format:{fmt}"]),
+        git_cmd(repo_path, ["log", ref, "--first-parent", "--merges", "-m",
+                            "--name-only", f"--pretty=format:{fmt}"]),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
