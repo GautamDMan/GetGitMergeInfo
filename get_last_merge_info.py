@@ -1,79 +1,80 @@
 #!/usr/bin/env python3
 """
-Optimized version of get_last_merge_info.py
+Optimized bulk-scan version of get_latest_file_changes.py.
 
-For each file name listed in input.csv, finds that file inside a single local
-git repository and reports the last merge commit that touched it: who merged
-it, who pushed the code, the merge message, and the branch it came from.
-
-What changed vs. the original (same CLI, same output columns):
-  * The file tree is indexed ONCE with `git ls-tree` (no os.walk per file).
-  * History is scanned in ONE streaming `git log --first-parent -m --name-only`
-    pass for all files, and stops early as soon as every file has been resolved
-    (original: one path-filtered `git log` per file).
-  * "pushed_by" lookups are batched into a single git call
-    (original: 2 git calls per file).
-  * "branch_merges" is built from ONE `git log --merges --all` pass
-    (original: one full pass per distinct branch).
-  * Read-only by default: no checkout / `reset --hard`. If "branch" is given
-    in git_login.json it is simply used as the ref to read, so uncommitted
-    work in the repo is never discarded.
+For each file name listed in input.csv, resolves the file at the configured
+Git ref and reports the latest commit that changed it. Commit history is read
+once for all requested paths, rather than running one `git log` per file.
 
 Usage:
-    python get_last_merge_info.py --input input.csv --creds git_login.json --output output.csv
+    python get_latest_file_changes.py \
+        --input input.csv \
+        --creds git_login.json \
+        --output output.csv
 
 input.csv:
     file_name
     config.py
     utils.py
 
+The file_name value may be either:
+  * a basename, such as config.py; every matching path is included
+  * a repository-relative path, such as src/config.py
+
 git_login.json:
     {
       "repo_path": "/path/to/the/repo",
-      "branch": "main"        // optional - ref whose history is read (default: HEAD)
+      "branch": "main"
     }
 
-output.csv columns:
-    file_name, resolved_path, merge_owner, pushed_by, pushed_by_email,
-    merge_message, merged_branch, merge_commit, merged_at, branch_merges
+The branch field is optional. HEAD is used when it is omitted.
 
-Optional one-time speedup for very large repos (Bloom filters for path queries):
-    git commit-graph write --reachable --changed-paths
+output.csv columns:
+    file_name, resolved_path, last_commit, last_commit_message,
+    last_modified_by, last_modified_email, last_modified_at
+
+Behavior:
+  * The tracked file tree is indexed once with `git ls-tree`.
+  * Commit history is streamed once with `git log --name-only`.
+  * The first occurrence of a requested path is its latest change.
+  * Scanning stops as soon as all requested paths have been resolved.
+  * The repository is read-only: no checkout, pull, fetch, or reset is done.
+  * Bulk mode reports history for the current path. It does not trace a file
+    through an older pre-rename path because Git supports --follow for only one
+    path at a time.
 """
 
 import argparse
 import csv
 import json
 import os
-import re
 import subprocess
 import sys
 from collections import defaultdict
 
-SEP = "\x01"      # field separator inside git --pretty formats
-MARK = "\x02"     # marks a commit header line in the streamed log
-
-# "Merge pull request #123 from owner/branch-name"
-PR_MERGE_RE = re.compile(r"Merge pull request #\d+ from ([^\s/]+)/(\S+)")
-# "Merge branch 'branch-name' into target"
-BRANCH_MERGE_RE = re.compile(r"Merge branch '([^']+)'")
+SEP = "\x01"
+MARK = "\x02"
 
 FIELDNAMES = [
-    "file_name", "resolved_path", "merge_owner", "pushed_by", "pushed_by_email",
-    "merge_message", "merged_branch", "merge_commit", "merged_at", "branch_merges",
+    "file_name",
+    "resolved_path",
+    "last_commit",
+    "last_commit_message",
+    "last_modified_by",
+    "last_modified_email",
+    "last_modified_at",
 ]
-EMPTY_INFO = {k: "" for k in FIELDNAMES[2:]}
+
+EMPTY_INFO = {key: "" for key in FIELDNAMES[2:]}
 
 
-# --------------------------------------------------------------------------- #
-# git helpers
-# --------------------------------------------------------------------------- #
 def git_cmd(repo_path, args):
-    # quotepath=false keeps non-ASCII file names readable instead of "\303\251"
+    """Build a Git command that keeps non-ASCII paths readable."""
     return ["git", "-C", repo_path, "-c", "core.quotepath=false"] + args
 
 
 def run_git(repo_path, args, stdin_text=None, check=True):
+    """Run Git and return stdout as UTF-8 text."""
     result = subprocess.run(
         git_cmd(repo_path, args),
         input=stdin_text,
@@ -82,261 +83,362 @@ def run_git(repo_path, args, stdin_text=None, check=True):
         encoding="utf-8",
         errors="replace",
     )
+
     if check and result.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+        raise RuntimeError(
+            f"git {' '.join(args)} failed: {result.stderr.strip()}"
+        )
+
     return result.stdout
 
 
-def parse_subject(subject):
-    """Return (pr_owner_or_None, merged_branch_or_'')."""
-    m = PR_MERGE_RE.search(subject)
-    if m:
-        return m.group(1), m.group(2)
-    m = BRANCH_MERGE_RE.search(subject)
-    if m:
-        return None, m.group(1)
-    return None, ""
-
-
-# --------------------------------------------------------------------------- #
-# inputs
-# --------------------------------------------------------------------------- #
 def load_credentials(creds_path):
-    with open(creds_path, "r", encoding="utf-8") as f:
-        creds = json.load(f)
+    """Load and validate repository settings."""
+    with open(creds_path, "r", encoding="utf-8") as file_handle:
+        creds = json.load(file_handle)
+
     repo_path = creds.get("repo_path")
     if not repo_path:
         raise ValueError("git_login.json must contain a 'repo_path' field")
+
+    repo_path = os.path.abspath(os.path.expanduser(repo_path))
     if not os.path.isdir(repo_path):
         raise ValueError(f"'{repo_path}' is not a directory")
-    out = run_git(repo_path, ["rev-parse", "--is-inside-work-tree"], check=False).strip()
-    if out != "true":
-        raise ValueError(f"'{repo_path}' does not look like a git repository")
-    return repo_path, creds.get("branch")  # branch is optional
+
+    inside_work_tree = run_git(
+        repo_path,
+        ["rev-parse", "--is-inside-work-tree"],
+        check=False,
+    ).strip()
+
+    if inside_work_tree != "true":
+        raise ValueError(f"'{repo_path}' does not look like a Git repository")
+
+    branch = creds.get("branch")
+    return repo_path, branch
 
 
-def load_file_names(input_csv):
-    names = []
-    with open(input_csv, "r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        if "file_name" not in (reader.fieldnames or []):
-            raise ValueError(
-                f"input.csv must have a 'file_name' column. Found: {reader.fieldnames}"
-            )
-        for row in reader:
-            name = (row["file_name"] or "").strip()
-            if name:
-                names.append(name)
-    return names
-
-
-# --------------------------------------------------------------------------- #
-# step 1: index tracked files once
-# --------------------------------------------------------------------------- #
-def build_name_index(repo_path, ref):
-    """basename -> [repo-relative paths] for every file tracked at `ref`."""
-    out = run_git(repo_path, ["ls-tree", "-r", "--name-only", "-z", ref])
-    index = defaultdict(list)
-    for path in out.split("\0"):
-        if path:
-            index[path.rsplit("/", 1)[-1]].append(path)
-    return index
-
-
-# --------------------------------------------------------------------------- #
-# step 2: one streaming pass over merge history for all target paths
-# --------------------------------------------------------------------------- #
-def find_last_merges(repo_path, ref, target_paths):
-    """Return {path: (hash, parents, author, subject, committed_at)} for the most
-    recent merge commit touching each path. Stops as soon as all are found.
-
-    --first-parent walks only the branch's own line of history and, together
-    with -m, diffs each merge against its FIRST parent only. So --name-only
-    lists exactly the files whose content the merge brought into the branch.
-    (Diffing against both parents would also list files merely changed on the
-    branch itself, crediting the merge for changes it did not bring.)"""
-    remaining = set(target_paths)
-    found = {}
-    if not remaining:
-        return found
-
-    fmt = f"{MARK}%H{SEP}%P{SEP}%an{SEP}%s{SEP}%cI"
-    proc = subprocess.Popen(
-        git_cmd(repo_path, ["log", ref, "--first-parent", "--merges", "-m",
-                            "--name-only", f"--pretty=format:{fmt}"]),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+def validate_ref(repo_path, ref):
+    """Verify that the configured branch, tag, or commit exists."""
+    result = subprocess.run(
+        git_cmd(repo_path, ["rev-parse", "--verify", f"{ref}^{{commit}}"]),
+        capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
+
+    if result.returncode != 0:
+        raise ValueError(
+            f"Git ref '{ref}' could not be resolved: {result.stderr.strip()}"
+        )
+
+
+def load_file_names(input_csv):
+    """Load non-empty values from the file_name CSV column."""
+    names = []
+
+    with open(input_csv, "r", newline="", encoding="utf-8-sig") as file_handle:
+        reader = csv.DictReader(file_handle)
+
+        if "file_name" not in (reader.fieldnames or []):
+            raise ValueError(
+                "input.csv must have a 'file_name' column. "
+                f"Found: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            name = (row.get("file_name") or "").strip()
+            if name:
+                names.append(name)
+
+    return names
+
+
+def build_file_indexes(repo_path, ref):
+    """Return the tracked path set and basename-to-path index at ref."""
+    output = run_git(
+        repo_path,
+        ["ls-tree", "-r", "--name-only", "-z", ref],
+    )
+
+    tracked_paths = set()
+    basename_index = defaultdict(list)
+
+    for path in output.split("\0"):
+        if not path:
+            continue
+
+        tracked_paths.add(path)
+        basename_index[path.rsplit("/", 1)[-1]].append(path)
+
+    return tracked_paths, basename_index
+
+
+def normalize_input_path(value):
+    """Normalize user-provided repository paths without touching the file system."""
+    normalized = value.strip().replace("\\", "/")
+
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+
+    return normalized.strip("/")
+
+
+def resolve_input_files(file_names, tracked_paths, basename_index):
+    """Resolve each unique CSV value to all matching tracked paths."""
+    errors = {}
+    resolved = {}
+
+    for input_name in dict.fromkeys(file_names):
+        normalized = normalize_input_path(input_name)
+
+        if not normalized:
+            errors[input_name] = error_row(input_name, "", "empty file name")
+            continue
+
+        # A value containing a directory component is treated as an exact
+        # repository-relative path. A basename expands to every matching path.
+        if "/" in normalized:
+            if normalized in tracked_paths:
+                resolved[input_name] = [normalized]
+            else:
+                errors[input_name] = error_row(
+                    input_name,
+                    normalized,
+                    f"file path '{normalized}' not found at the selected Git ref",
+                )
+            continue
+
+        matches = sorted(basename_index.get(normalized, []))
+
+        if not matches:
+            errors[input_name] = error_row(
+                input_name,
+                "",
+                f"file '{input_name}' not found at the selected Git ref",
+            )
+        else:
+            resolved[input_name] = matches
+
+    return errors, resolved
+
+
+def find_latest_changes(repo_path, ref, target_paths):
+    """
+    Return the newest commit information for every target path.
+
+    Git emits commits newest-first. Once a target path appears beneath a commit
+    header, that commit is the latest change for the path. The process stops as
+    soon as all requested paths are found.
+    """
+    remaining = set(target_paths)
+    found = {}
+
+    if not remaining:
+        return found
+
+    pretty_format = (
+        f"{MARK}%H{SEP}%an{SEP}%ae{SEP}%s{SEP}%cI"
+    )
+
+    process = subprocess.Popen(
+        git_cmd(
+            repo_path,
+            [
+                "log",
+                ref,
+                "--name-only",
+                "--no-renames",
+                "--date-order",
+                f"--pretty=format:{pretty_format}",
+                "--",
+            ],
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    current_commit = None
+    stderr_text = ""
+
     try:
-        current = None
-        for raw in proc.stdout:
-            line = raw.rstrip("\n").rstrip("\r")
+        if process.stdout is None:
+            raise RuntimeError("Unable to read Git history output")
+
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\r\n")
+
             if line.startswith(MARK):
-                parts = line[1:].split(SEP)
-                current = tuple(parts) if len(parts) == 5 else None
-            elif line and current is not None and line in remaining:
-                found[line] = current
-                remaining.discard(line)
+                parts = line[1:].split(SEP, 4)
+                current_commit = tuple(parts) if len(parts) == 5 else None
+                continue
+
+            if not line or current_commit is None:
+                continue
+
+            if line in remaining:
+                found[line] = current_commit
+                remaining.remove(line)
+
                 if not remaining:
-                    break  # everything resolved - no need to read older history
+                    break
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-        proc.stdout.close()
-        proc.wait()
+        if process.poll() is None:
+            process.terminate()
+
+        if process.stdout is not None:
+            process.stdout.close()
+
+        try:
+            _, stderr_text = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _, stderr_text = process.communicate()
+
+    # A non-zero return code is expected when we terminate early after finding
+    # all paths. Treat it as an error only when the scan did not complete early.
+    if remaining and process.returncode not in (0, None):
+        raise RuntimeError(
+            f"git log failed: {(stderr_text or '').strip()}"
+        )
+
     return found
 
 
-# --------------------------------------------------------------------------- #
-# step 3: batched "who pushed it" lookup
-# --------------------------------------------------------------------------- #
-def batch_pushed_by(repo_path, merges):
-    """For each merge, the author of the merged-in branch tip (2nd parent);
-    falls back to the merge commit itself if it has fewer than 2 parents.
-    One git call for all of them. Returns {target_hash: (name, email)}."""
-    targets = set()
-    for commit_hash, parents, *_ in merges:
-        ph = parents.split()
-        targets.add(ph[1] if len(ph) >= 2 else commit_hash)
-    if not targets:
-        return {}
-    out = run_git(
-        repo_path,
-        ["log", "--no-walk=unsorted", "--stdin", f"--pretty=format:%H{SEP}%an{SEP}%ae"],
-        stdin_text="\n".join(sorted(targets)) + "\n",
-        check=False,
-    )
-    result = {}
-    for line in out.splitlines():
-        parts = line.split(SEP)
-        if len(parts) == 3:
-            result[parts[0]] = (parts[1], parts[2])
-    return result
-
-
-# --------------------------------------------------------------------------- #
-# step 4: branch -> all merges, from a single pass
-# --------------------------------------------------------------------------- #
-def build_branch_merges_map(repo_path):
-    """{branch_name: '<short_hash> (<date>); ...'} across all merges in the repo."""
-    out = run_git(
-        repo_path,
-        ["log", "--merges", "--all", f"--pretty=format:%H{SEP}%s{SEP}%cI"],
-        check=False,
-    )
-    entries = defaultdict(list)
-    for line in out.splitlines():
-        parts = line.split(SEP)
-        if len(parts) != 3:
-            continue
-        commit_hash, subject, committed_at = parts
-        _, branch_name = parse_subject(subject)
-        if branch_name:
-            entries[branch_name].append(f"{commit_hash[:8]} ({committed_at})")
-    return {b: "; ".join(v) for b, v in entries.items()}
-
-
-# --------------------------------------------------------------------------- #
-# main
-# --------------------------------------------------------------------------- #
 def error_row(file_name, resolved_path, message):
-    row = {"file_name": file_name, "resolved_path": resolved_path, **EMPTY_INFO}
-    row["merge_message"] = f"ERROR: {message}"
+    """Create a CSV row containing an error in the message column."""
+    row = {
+        "file_name": file_name,
+        "resolved_path": resolved_path,
+        **EMPTY_INFO,
+    }
+    row["last_commit_message"] = f"ERROR: {message}"
     return row
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Find last merge info for each file name listed in input.csv"
+        description=(
+            "Find the latest Git commit for every file listed in input.csv "
+            "using one bulk history scan"
+        )
     )
-    parser.add_argument("--input", default="input.csv", help="Path to input.csv")
-    parser.add_argument("--creds", default="git_login.json", help="Path to git_login.json")
-    parser.add_argument("--output", default="output.csv", help="Path to output.csv")
+
+    parser.add_argument(
+        "--input",
+        default="input.csv",
+        help="Path to input.csv",
+    )
+    parser.add_argument(
+        "--creds",
+        default="git_login.json",
+        help="Path to git_login.json",
+    )
+    parser.add_argument(
+        "--output",
+        default="output.csv",
+        help="Path to output.csv",
+    )
     args = parser.parse_args()
 
     try:
         repo_path, branch = load_credentials(args.creds)
-    except Exception as e:
-        print(f"Error loading credentials: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
         file_names = load_file_names(args.input)
-    except Exception as e:
-        print(f"Error loading input.csv: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Input error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     ref = branch or "HEAD"
-    print(f"Reading history of '{ref}' in {repo_path} (read-only, no checkout/reset)...")
 
     try:
-        name_index = build_name_index(repo_path, ref)
-    except Exception as e:
-        print(f"Error reading tree at '{ref}': {e}", file=sys.stderr)
+        validate_ref(repo_path, ref)
+    except Exception as exc:
+        print(f"Reference error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve every input name to a unique path (or an error row).
-    rows = {}            # file_name -> row dict (final or partially filled)
-    to_lookup = {}       # file_name -> resolved relative path
-    for file_name in dict.fromkeys(file_names):  # de-dupe, keep order
-        matches = name_index.get(file_name, [])
-        if not matches:
-            rows[file_name] = error_row(file_name, "", f"file '{file_name}' not found in repo")
-        elif len(matches) > 1:
-            rows[file_name] = error_row(
-                file_name, "",
-                f"ambiguous: found {len(matches)} files named '{file_name}': {sorted(matches)}",
+    print(
+        f"Reading history of '{ref}' in {repo_path} "
+        "(read-only, bulk scan)..."
+    )
+
+    try:
+        tracked_paths, basename_index = build_file_indexes(repo_path, ref)
+    except Exception as exc:
+        print(f"Error reading tree at '{ref}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    errors, resolved = resolve_input_files(
+        file_names,
+        tracked_paths,
+        basename_index,
+    )
+
+    unique_target_paths = {
+        path
+        for paths in resolved.values()
+        for path in paths
+    }
+    print(f"Scanning commit history for {len(unique_target_paths)} unique path(s)...")
+
+    try:
+        changes = find_latest_changes(repo_path, ref, unique_target_paths)
+    except Exception as exc:
+        print(f"Error scanning Git history: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    rows_by_input = {}
+    for input_name, paths in resolved.items():
+        output_rows = []
+
+        for rel_path in paths:
+            change = changes.get(rel_path)
+
+            if change is None:
+                output_rows.append(
+                    error_row(
+                        input_name,
+                        rel_path,
+                        "no commit history found for this path",
+                    )
+                )
+                continue
+
+            commit_hash, author, email, subject, committed_at = change
+            output_rows.append(
+                {
+                    "file_name": input_name,
+                    "resolved_path": rel_path,
+                    "last_commit": commit_hash,
+                    "last_commit_message": subject,
+                    "last_modified_by": author,
+                    "last_modified_email": email,
+                    "last_modified_at": committed_at,
+                }
             )
+
+        rows_by_input[input_name] = output_rows
+
+    output_rows = []
+    for input_name in file_names:
+        if input_name in errors:
+            output_rows.append(errors[input_name])
         else:
-            to_lookup[file_name] = matches[0]
+            output_rows.extend(rows_by_input[input_name])
 
-    print(f"Scanning merge history for {len(to_lookup)} file(s)...")
     try:
-        found = find_last_merges(repo_path, ref, set(to_lookup.values()))
-    except Exception as e:
-        print(f"Error scanning history: {e}", file=sys.stderr)
+        with open(args.output, "w", newline="", encoding="utf-8") as file_handle:
+            writer = csv.DictWriter(file_handle, fieldnames=FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(output_rows)
+    except Exception as exc:
+        print(f"Error writing output CSV: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    pushed = batch_pushed_by(repo_path, list(found.values()))
-    branch_map = build_branch_merges_map(repo_path) if found else {}
-
-    for file_name, rel_path in to_lookup.items():
-        merge = found.get(rel_path)
-        if merge is None:
-            rows[file_name] = error_row(
-                file_name, rel_path, "no merge commit found that touched this file"
-            )
-            continue
-
-        commit_hash, parents, author, subject, committed_at = merge
-        pr_owner, merged_branch = parse_subject(subject)
-        ph = parents.split()
-        tip = ph[1] if len(ph) >= 2 else commit_hash
-        pushed_name, pushed_email = pushed.get(tip, ("", ""))
-
-        rows[file_name] = {
-            "file_name": file_name,
-            "resolved_path": rel_path,
-            "merge_owner": pr_owner or author,
-            "pushed_by": pushed_name,
-            "pushed_by_email": pushed_email,
-            "merge_message": subject,
-            "merged_branch": merged_branch,
-            "merge_commit": commit_hash,
-            "merged_at": committed_at,
-            "branch_merges": branch_map.get(merged_branch, "") if merged_branch else "",
-        }
-
-    # Write one row per input line, in the original order (duplicates repeated).
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows[name] for name in file_names)
-
-    print(f"\nDone. Wrote {len(file_names)} rows to {args.output}")
+    print(f"Done. Wrote {len(output_rows)} row(s) to {args.output}")
 
 
 if __name__ == "__main__":
